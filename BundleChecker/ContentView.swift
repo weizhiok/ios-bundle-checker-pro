@@ -2,7 +2,24 @@ import SwiftUI
 import Security
 import Foundation
 
-// --- 程序入口 ---
+// ========================================================================
+// 🛠️ 核心修复：手动声明系统隐藏的底层安全函数 (C-API Bridge)
+// 只有加上这段，Swift 才能调用那些大厂用来检测真实身份的“隐藏接口”
+// ========================================================================
+
+// 定义 opaque 类型来代表 SecTask
+typealias SecTaskRef = AnyObject
+
+// 手动映射 C 语言的 SecTaskCreateFromSelf
+@_silgen_name("SecTaskCreateFromSelf")
+func SecTaskCreateFromSelf(_ allocator: CFAllocator?) -> SecTaskRef?
+
+// 手动映射 C 语言的 SecTaskCopySigningIdentifier
+@_silgen_name("SecTaskCopySigningIdentifier")
+func SecTaskCopySigningIdentifier(_ task: SecTaskRef, _ error: UnsafeMutablePointer<Unmanaged<CFError>?>?) -> CFString?
+
+// ========================================================================
+
 @main
 struct BundleCheckerApp: App {
     var body: some Scene {
@@ -12,19 +29,18 @@ struct BundleCheckerApp: App {
     }
 }
 
-// --- 界面逻辑 ---
 struct ContentView: View {
     @State private var results: [ResultItem] = []
 
     struct ResultItem: Hashable {
         let title: String
         let value: String
-        let isSuspicious: Bool // 如果检测结果和API层不一致，标红
+        let isSuspicious: Bool
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text("BundleID 终极风控检测")
+            Text("BundleID 攻防检测")
                 .font(.headline)
                 .padding()
                 .frame(maxWidth: .infinity, alignment: .center)
@@ -40,7 +56,7 @@ struct ContentView: View {
                         Text(item.value)
                             .font(.system(size: 13, design: .monospaced))
                             .foregroundColor(item.isSuspicious ? .red : .primary)
-                            .textSelection(.enabled) // 允许长按复制
+                            .textSelection(.enabled)
                     }
                     .padding(.vertical, 4)
                 }
@@ -55,97 +71,90 @@ struct ContentView: View {
     func performDeepChecks() {
         var items: [ResultItem] = []
         
-        // 1. 基准值 (会被 Hook 的值)
+        // 1. 基准值 (API层，最容易被 Hook 篡改)
         let standardID = Bundle.main.bundleIdentifier ?? "Unknown"
         items.append(ResultItem(title: "【API层】Bundle.main (易被篡改)", value: standardID, isSuspicious: false))
         
-        // 2. Security 框架 (SecTask) - 核心防御手段
-        // 你的 Hook 代码无法拦截这个，因为它是基于内核授权信息的 C API
+        // 2. 内核层 SecTask (通过手动映射调用隐藏 API)
         let secID = getSecTaskSigningIdentifier()
         items.append(ResultItem(title: "【内核层】SecTask (权威真实)", value: secID, isSuspicious: secID != standardID))
         
-        // 3. C语言底层文件流读取 Info.plist
-        // 绕过 [NSDictionary dictionaryWithContentsOfFile:] 的 Hook
+        // 3. IO层 fopen (绕过 Runtime Hook)
         let cPlistID = getBundleIDFromPlistUsingFopen()
         items.append(ResultItem(title: "【IO层】fopen读取 Info.plist", value: cPlistID, isSuspicious: cPlistID != standardID))
         
-        // 4. 描述文件解析 embedded.mobileprovision
-        // 这是重签名的铁证
+        // 4. 证书层 mobileprovision (签名指纹)
         let provisionID = getMobileProvisionID()
-        // 注意：描述文件里的 ID 通常带 TeamID 前缀 (例如 A1B2C3D4.com.xxx)，需要包含性判断
         let isProvSuspicious = !provisionID.contains(standardID) && provisionID != "未找到或模拟器"
         items.append(ResultItem(title: "【证书层】embedded.mobileprovision", value: provisionID, isSuspicious: isProvSuspicious))
         
         self.results = items
     }
     
-    // --- 核心对抗函数 1: SecTask ---
+    // --- 核心实现 1: 调用隐藏的 SecTask ---
     func getSecTaskSigningIdentifier() -> String {
-        // 创建自身的 SecTask 引用
         guard let secTask = SecTaskCreateFromSelf(kCFAllocatorDefault) else {
             return "SecTask 创建失败"
         }
-        // 直接从代码签名Entitlements中提取 application-identifier
-        // 这是一个 CFString，Swift 会自动桥接，但通常很难被 OC Runtime Hook 影响
+        
+        // 这里的 nil 之前报错，现在因为有明确的函数定义，Swift 知道它是 pointer 类型
         if let idRef = SecTaskCopySigningIdentifier(secTask, nil) {
             return idRef as String
         }
-        return "获取失败 (可能无签名)"
+        return "获取失败 (无签名或权限不足)"
     }
     
-    // --- 核心对抗函数 2: fopen (C Standard IO) ---
+    // --- 核心实现 2: 使用 C 标准库 fopen ---
     func getBundleIDFromPlistUsingFopen() -> String {
         guard let path = Bundle.main.path(forResource: "Info", ofType: "plist") else {
             return "Info.plist 路径未找到"
         }
         
-        // 使用 C 语言标准库打开文件，完全无视 OC/Cocoa 的 Swizzling
+        // 打开文件
         guard let file = fopen(path, "r") else {
             return "fopen 打开失败"
         }
         defer { fclose(file) }
         
-        // 读取文件内容到缓冲区
+        // 获取文件大小
         fseek(file, 0, SEEK_END)
         let fileSize = ftell(file)
         fseek(file, 0, SEEK_SET)
         
+        if fileSize <= 0 { return "文件为空" }
+        
+        // 读取内容
         var buffer = [CChar](repeating: 0, count: Int(fileSize) + 1)
         fread(&buffer, 1, Int(fileSize), file)
         
-        // 转为字符串进行暴力搜索
+        // 暴力转字符串搜索
         let content = String(cString: buffer)
         
-        // 手动解析 XML (很简陋，但足以对抗 Hook)
-        // 寻找 <key>CFBundleIdentifier</key> 下面的 <string>...</string>
+        // 简单解析 XML
         if let keyRange = content.range(of: "CFBundleIdentifier") {
             let sub = content[keyRange.upperBound...]
             if let start = sub.range(of: "<string>"), let end = sub.range(of: "</string>") {
-                let foundID = String(sub[start.upperBound..<end.lowerBound])
-                return foundID
+                return String(sub[start.upperBound..<end.lowerBound])
             }
         }
         
         return "解析失败"
     }
     
-    // --- 核心对抗函数 3: 描述文件扫描 ---
+    // --- 核心实现 3: 描述文件扫描 ---
     func getMobileProvisionID() -> String {
         guard let path = Bundle.main.path(forResource: "embedded", ofType: "mobileprovision") else {
             return "未找到 (可能是模拟器)"
         }
         
-        // 同样使用 Data 读取，虽然 Data 可能被 Hook，但这里我们用 Latin1 编码扫描二进制
         do {
             let data = try Data(contentsOf: URL(fileURLWithPath: path))
-            // 强制 Latin1 解码，防止二进制乱码导致解析中断
             let content = String(data: data, encoding: .isoLatin1) ?? ""
             
             if let range = content.range(of: "<key>application-identifier</key>") {
                 let sub = content[range.upperBound...]
                 if let start = sub.range(of: "<string>"), let end = sub.range(of: "</string>") {
-                    let fullID = String(sub[start.upperBound..<end.lowerBound])
-                    return fullID
+                    return String(sub[start.upperBound..<end.lowerBound])
                 }
             }
         } catch {
